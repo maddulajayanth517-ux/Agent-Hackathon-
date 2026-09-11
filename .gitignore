@@ -10,3 +10,8 @@ backend/.env
 
 # OS
 .DS_Store
+
+backend/.venv/
+__pycache__/
+*.pyc
+.env
