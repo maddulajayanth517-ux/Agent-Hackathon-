@@ -1,20 +1,69 @@
-from __future__ import annotations
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from backend.app.routers.allocations import router as allocations_router
-from backend.app.routers.brief import router as brief_router
-from backend.app.routers.escalations import router as escalations_router
-from backend.app.routers.flags import router as flags_router
-
-app = FastAPI(title="Mentor Intelligence API")
-
-app.include_router(allocations_router)
-app.include_router(brief_router)
-app.include_router(flags_router)
-app.include_router(escalations_router)
+from .database import engine
+from .routers import allocations, brief, meetings, reports, flags, escalations
 
 
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    connection = engine.connect()
+    connection.close()
+    yield
+    engine.dispose()
+
+
+app = FastAPI(
+    title="Agent-45 Mentoring Intelligence Platform",
+    description=(
+        "Production-oriented backend for mentoring, "
+        "meeting management, action tracking, RBAC, "
+        "compliance reporting, and auditability."
+    ),
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    lifespan=lifespan,
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8501"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+@app.get(
+    "/",
+    tags=["System"],
+)
+def root():
+    return {
+        "service": "Agent-45 Mentoring Intelligence Platform",
+        "status": "online",
+        "version": app.version,
+    }
+
+
+@app.get(
+    "/health",
+    tags=["System"],
+)
+def health_check():
+    return {
+        "status": "healthy",
+        "database": "configured",
+    }
+
+app.include_router(allocations.router)
+app.include_router(brief.router)
+app.include_router(flags.router)
+app.include_router(meetings.router)
+app.include_router(reports.router)
+app.include_router(escalations.router)

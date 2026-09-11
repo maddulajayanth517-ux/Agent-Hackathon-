@@ -1,4 +1,17 @@
-
-.env.local
-.venv/
+# Python
+venv/
 __pycache__/
+*.pyc
+.env
+backend/.env
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+
+backend/.venv/
+__pycache__/
+*.pyc
+.env

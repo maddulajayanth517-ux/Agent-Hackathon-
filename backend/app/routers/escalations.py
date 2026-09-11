@@ -1,78 +1,191 @@
-from __future__ import annotations
+from datetime import datetime
 
-from typing import Any, Dict
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from fastapi import APIRouter, HTTPException, status
+from ..database import get_db
+from ..models import Escalation, EscalationStatus, FlagSeverity, UserRole
+from ..rbac import can_access_student, get_current_user
+from ..schemas import UserContext
 
-from backend.app.database import Escalation, get_db
-from backend.app.models import EscalationDecision
-
-router = APIRouter(prefix="/escalations", tags=["escalations"])
-
-
-def determine_escalation(flag: Any) -> EscalationDecision:
-    category = str(flag.category).upper()
-    severity = str(flag.severity).upper()
-
-    if category == "ACADEMIC":
-        destination = "HOD"
-        priority = "HIGH" if severity in {"HIGH", "CRITICAL"} else "MEDIUM"
-        reason = "High-severity academic concerns require departmental intervention." if severity in {"HIGH", "CRITICAL"} else "Academic concerns are routed to the HOD for review and support."
-    elif category == "PERSONAL":
-        destination = "Counselling / Agent 66"
-        priority = "HIGH" if severity in {"HIGH", "CRITICAL"} else "MEDIUM"
-        reason = "Personal concerns are routed to counselling and a support agent for appropriate follow-up."
-    elif category == "FINANCIAL":
-        destination = "Finance / Scholarship"
-        priority = "HIGH" if severity in {"HIGH", "CRITICAL"} else "MEDIUM"
-        reason = "Financial hardship requires finance or scholarship support to resolve the risk."
-    elif category == "CAREER":
-        destination = "Career Guidance"
-        priority = "HIGH" if severity in {"HIGH", "CRITICAL"} else "MEDIUM"
-        reason = "Career concerns should be reviewed by the career guidance team."
-    elif category == "ATTENDANCE":
-        destination = "Mentor / HOD"
-        priority = "HIGH" if severity in {"HIGH", "CRITICAL"} else "MEDIUM"
-        reason = "Attendance issues are handled by the mentor first and escalated to HOD when risk increases."
-    else:
-        destination = "Mentor"
-        priority = "MEDIUM"
-        reason = "General concerns are managed by the mentor with monitoring."
-
-    if severity == "LOW":
-        destination = "Mentor"
-        priority = "LOW"
-        reason = "Low-severity issues are handled by the mentor and monitored."
-    elif severity == "CRITICAL":
-        destination = "Immediate institutional escalation"
-        priority = "CRITICAL"
-        reason = "Critical severity requires immediate escalation according to the institutional workflow."
-
-    return EscalationDecision(destination=destination, priority=priority, reason=reason, route=destination)
+router = APIRouter(prefix="/escalations", tags=["Escalations"])
 
 
-@router.get("/{flag_id}")
-async def get_escalation(flag_id: int) -> Dict[str, Any]:
-    db = get_db()
-    flag = db.flags.get(flag_id)
-    if not flag:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Flag not found")
+class EscalationCreate(BaseModel):
+    student_id: int
+    severity: FlagSeverity
+    reason: str = Field(min_length=3, max_length=2000)
+    assigned_to: int | None = None
 
-    decision = determine_escalation(flag)
-    db.escalations[flag_id] = Escalation(
-        id=flag_id,
-        flag_id=flag_id,
-        destination=decision.destination,
-        priority=decision.priority,
-        reason=decision.reason,
-        status="PENDING",
+
+class EscalationUpdate(BaseModel):
+    status: EscalationStatus | None = None
+    assigned_to: int | None = None
+    resolution_notes: str | None = Field(default=None, max_length=2000)
+
+
+class EscalationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    student_id: int
+    raised_by: int
+    assigned_to: int | None
+    severity: FlagSeverity
+    reason: str
+    status: EscalationStatus
+    resolution_notes: str | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+
+MANAGE_ROLES = {
+    UserRole.ADMIN,
+    UserRole.MENTOR,
+    UserRole.HOD,
+    UserRole.COUNSELLOR,
+}
+
+
+@router.post(
+    "",
+    response_model=EscalationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_escalation(
+    payload: EscalationCreate,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    if user.role not in MANAGE_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to create escalations",
+        )
+
+    if not can_access_student(
+        db=db,
+        user=user,
+        student_id=payload.student_id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "student_access_denied",
+                "student_id": payload.student_id,
+            },
+        )
+
+    escalation = Escalation(
+        student_id=payload.student_id,
+        raised_by=user.id,
+        assigned_to=payload.assigned_to,
+        severity=payload.severity,
+        reason=payload.reason.strip(),
+        status=EscalationStatus.OPEN,
     )
 
-    return {
-        "flag_id": flag_id,
-        "category": flag.category,
-        "severity": flag.severity,
-        "destination": decision.destination,
-        "priority": decision.priority,
-        "reason": decision.reason,
-    }
+    db.add(escalation)
+    db.commit()
+    db.refresh(escalation)
+
+    return escalation
+
+
+@router.get(
+    "/student/{student_id}",
+    response_model=list[EscalationResponse],
+)
+def get_student_escalations(
+    student_id: int,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    if user.role not in {
+        UserRole.ADMIN,
+        UserRole.HOD,
+        UserRole.COUNSELLOR,
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to view escalations",
+        )
+
+    if not can_access_student(
+        db=db,
+        user=user,
+        student_id=student_id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Student access denied",
+        )
+
+    return db.scalars(
+        select(Escalation)
+        .where(Escalation.student_id == student_id)
+        .order_by(Escalation.created_at.desc())
+    ).all()
+
+
+@router.patch(
+    "/{escalation_id}",
+    response_model=EscalationResponse,
+)
+def update_escalation(
+    escalation_id: int,
+    payload: EscalationUpdate,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    if user.role not in {
+        UserRole.ADMIN,
+        UserRole.HOD,
+        UserRole.COUNSELLOR,
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to update escalations",
+        )
+
+    escalation = db.scalar(
+        select(Escalation).where(Escalation.id == escalation_id)
+    )
+
+    if escalation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Escalation not found",
+        )
+
+    if not can_access_student(
+        db=db,
+        user=user,
+        student_id=escalation.student_id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Student access denied",
+        )
+
+    if payload.status is not None:
+        escalation.status = payload.status
+
+        if payload.status in {
+            EscalationStatus.RESOLVED,
+            EscalationStatus.CLOSED,
+        }:
+            escalation.resolved_at = datetime.utcnow()
+
+    if payload.assigned_to is not None:
+        escalation.assigned_to = payload.assigned_to
+
+    if payload.resolution_notes is not None:
+        escalation.resolution_notes = payload.resolution_notes.strip()
+
+    db.commit()
+    db.refresh(escalation)
+
+    return escalation
