@@ -10,6 +10,8 @@ from ..models import (
     ActionStatus,
     AuditEvent,
     MeetingRecord,
+    ScheduledMeeting,
+    ScheduledMeetingStatus,
     User,
     UserRole,
 )
@@ -78,13 +80,10 @@ def create_meeting(
     db: Session = Depends(get_db),
     user: UserContext = Depends(get_current_user),
 ):
-    if user.role not in {
-        UserRole.ADMIN,
-        UserRole.MENTOR,
-    }:
+    if user.role != UserRole.MENTOR:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only mentors or administrators can create meeting records",
+            detail="Only the student's allocated mentor can create meeting records",
         )
 
     if not can_access_student(
@@ -120,6 +119,11 @@ def create_meeting(
         notes=payload.notes,
         student_concerns=payload.student_concerns,
         mentor_observations=payload.mentor_observations,
+        academic_progress=payload.academic_progress,
+        attendance_review=payload.attendance_review,
+        personal_circumstances=payload.personal_circumstances,
+        career_direction=payload.career_direction,
+        recording_boundary_acknowledged=payload.recording_boundary_acknowledged,
         next_meeting_at=payload.next_meeting_at,
         created_by=user.id,
     )
@@ -127,7 +131,17 @@ def create_meeting(
     db.add(meeting)
     db.flush()
 
+    if payload.scheduled_meeting_id is not None:
+        scheduled = db.scalar(select(ScheduledMeeting).where(ScheduledMeeting.id == payload.scheduled_meeting_id))
+        if scheduled is None or scheduled.student_id != payload.student_id or scheduled.mentor_id != mentor.id:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Scheduled meeting does not match this mentor and student")
+        scheduled.status = ScheduledMeetingStatus.COMPLETED
+        scheduled.completed_meeting_id = meeting.id
+
     for action_payload in payload.action_items:
+        owner = db.scalar(select(User).where(User.id == action_payload.owner_id, User.is_active.is_(True)))
+        if owner is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Action-item owner must be an active user")
         if action_payload.due_date < date.today():
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

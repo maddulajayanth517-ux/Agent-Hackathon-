@@ -1,13 +1,18 @@
 from enum import Enum
 from typing import Callable
 
+import os
+
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .database import get_db
+from .auth import verify_access_token
 from .models import (
     Allocation,
+    Escalation,
+    EscalationStatus,
     Mentor,
     Student,
     User,
@@ -54,19 +59,25 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
 
 def get_current_user(
     x_user_id: int | None = Header(default=None),
+    authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> UserContext:
-
-    if x_user_id is None:
+    user_id: int | None = None
+    if authorization and authorization.lower().startswith("bearer "):
+        claims = verify_access_token(authorization.split(" ", 1)[1])
+        user_id = int(claims["sub"])
+    elif x_user_id is not None and os.getenv("AUTH_ALLOW_DEV_HEADER", "true").lower() == "true":
+        user_id = x_user_id
+    else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authenticated user context is required",
+            detail="Bearer authentication is required",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
     user = db.scalar(
         select(User).where(
-            User.id == x_user_id,
+            User.id == user_id,
             User.is_active.is_(True),
         )
     )
@@ -216,11 +227,16 @@ def can_access_student(
     if user.role == UserRole.ADMIN:
         return True
 
-    if user.role == UserRole.HOD:
-        return get_student_by_id(db, student_id) is not None
-
-    if user.role == UserRole.COUNSELLOR:
-        return get_student_by_id(db, student_id) is not None
+    if user.role in {UserRole.HOD, UserRole.COUNSELLOR}:
+        # Sensitive mentoring notes are visible to an escalation role only when
+        # it is explicitly named on that student's active escalation.
+        return db.scalar(
+            select(Escalation.id).where(
+                Escalation.student_id == student_id,
+                Escalation.assigned_to == user.id,
+                Escalation.status.in_([EscalationStatus.OPEN, EscalationStatus.ACKNOWLEDGED]),
+            )
+        ) is not None
 
     if user.role == UserRole.MENTOR:
         return mentor_can_access_student(

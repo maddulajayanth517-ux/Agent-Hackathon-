@@ -6,6 +6,7 @@ from .models import (
     ActionStatus,
     MeetingMode,
     UserRole,
+    ScheduledMeetingStatus,
 )
 
 
@@ -55,7 +56,13 @@ class MeetingCreate(BaseModel):
     notes: str = Field(min_length=1)
     student_concerns: str | None = None
     mentor_observations: str | None = None
+    academic_progress: str | None = Field(default=None, max_length=4000)
+    attendance_review: str | None = Field(default=None, max_length=4000)
+    personal_circumstances: str | None = Field(default=None, max_length=4000)
+    career_direction: str | None = Field(default=None, max_length=4000)
+    recording_boundary_acknowledged: bool = False
     next_meeting_at: datetime | None = None
+    scheduled_meeting_id: int | None = None
     action_items: list[ActionItemCreate] = Field(default_factory=list)
 
 
@@ -71,6 +78,11 @@ class MeetingResponse(BaseModel):
     notes: str
     student_concerns: str | None
     mentor_observations: str | None
+    academic_progress: str | None
+    attendance_review: str | None
+    personal_circumstances: str | None
+    career_direction: str | None
+    recording_boundary_acknowledged: bool
     next_meeting_at: datetime | None
     created_by: int
     created_at: datetime
@@ -107,6 +119,7 @@ class MentorLoad(BaseModel):
 class AllocationCreate(BaseModel):
     student_id: int
     mentor_id: int
+    reason: str = Field(min_length=3, max_length=500)
 
 
 class AllocationResponse(BaseModel):
@@ -117,3 +130,27 @@ class AllocationResponse(BaseModel):
     mentor_id: int
     allocated_at: datetime
     is_active: bool
+    allocation_reason: str
+    reallocated_from_mentor_id: int | None
+    ended_at: datetime | None
+
+
+class ScheduledMeetingCreate(BaseModel):
+    student_id: int
+    scheduled_for: datetime
+    mode: MeetingMode
+    agenda: str | None = Field(default=None, max_length=2000)
+
+
+class ScheduledMeetingResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    student_id: int
+    mentor_id: int
+    scheduled_for: datetime
+    mode: MeetingMode
+    agenda: str | None
+    status: ScheduledMeetingStatus
+    completed_meeting_id: int | None
+    created_by: int
+    created_at: datetime

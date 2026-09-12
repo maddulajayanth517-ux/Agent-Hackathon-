@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from ..agent import build_student_mentor_brief
 from ..database import get_db
 from ..models import (
     ActionItem,
@@ -12,6 +13,7 @@ from ..models import (
     Mentor,
     Student,
     User,
+    Flag,
 )
 from ..rbac import can_access_student, get_current_user
 from ..schemas import UserContext
@@ -80,6 +82,9 @@ def get_student_brief(
         .where(ActionItem.student_id == student_id)
         .order_by(ActionItem.due_date.asc())
     ).all()
+    flags = db.scalars(
+        select(Flag).where(Flag.student_id == student_id, Flag.is_active.is_(True)).order_by(Flag.created_at.desc())
+    ).all()
 
     now = datetime.utcnow()
 
@@ -105,7 +110,7 @@ def get_student_brief(
 
     latest_meeting = meetings[0] if meetings else None
 
-    return {
+    base_response = {
         "student": {
             "id": student.id,
             "user_id": student.user_id,
@@ -167,5 +172,55 @@ def get_student_brief(
             }
             for action in actions
         ],
+        "key_changes": [
+            f"New active flag: {flag.category} ({flag.severity.value}) — {flag.description}"
+            for flag in flags[:5]
+        ] + ([f"Last meeting was on {latest_meeting.meeting_at.date()}." ] if latest_meeting else ["No meeting has been recorded yet."]),
+        "open_concerns": [flag.description for flag in flags[:5]],
+        "pending_actions": [
+            f"{action.title} (due {action.due_date.date() if action.due_date else 'no deadline'})"
+            for action in open_actions
+        ],
+        "discussion_points": [
+            "Review academic progress and attendance since the last meeting.",
+            "Confirm progress on each pending action and remove blockers.",
+            "Discuss career direction and any support the student has requested.",
+        ],
         "generated_at": datetime.utcnow(),
     }
+
+    risk_snapshot = build_student_mentor_brief(db, student_id)
+    base_response["source"] = "agent"
+    base_response["warning"] = "Institutional mentor brief generated from current records."
+    base_response["risk"] = {
+        "score": risk_snapshot["risk_score"],
+        "level": risk_snapshot["risk_level"],
+        "alerts": risk_snapshot["alerts"],
+    }
+    base_response["recommendations"] = risk_snapshot["recommendations"]
+    base_response["next_steps"] = risk_snapshot["next_steps"]
+    base_response["recommended_next_steps"] = risk_snapshot["next_steps"]
+    if risk_snapshot.get("institutional_context"):
+        base_response["institutional_context"] = risk_snapshot["institutional_context"]
+    return base_response
+
+
+@router.get("/{student_id}", include_in_schema=False)
+def get_student_brief_compat(
+    student_id: int,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    payload = get_student_brief(student_id, db, user)
+    payload["source"] = "fallback"
+    payload["warning"] = "AI brief unavailable; using institutional fallback mentoring summary."
+    payload["risk"] = {
+        "score": 0,
+        "level": "low",
+        "alerts": [],
+    }
+    payload["recommendations"] = [
+        "Continue regular mentoring review.",
+        "Track overdue actions and new flags promptly.",
+    ]
+    return payload

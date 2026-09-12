@@ -1,7 +1,11 @@
-from datetime import datetime, timedelta
+import csv
+import io
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, case, select
+from fastapi.responses import StreamingResponse
+from sqlalchemy import case, func, select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -15,17 +19,99 @@ from ..models import (
     Flag,
     MeetingRecord,
     Mentor,
+    ScheduledMeeting,
+    ScheduledMeetingStatus,
     Student,
     User,
     UserRole,
 )
 from ..rbac import Permission, require_permission
+from ..policy import frequency_days
 from ..schemas import UserContext
 
 router = APIRouter(
     prefix="/reports",
     tags=["Reports"],
 )
+
+
+def frequency_compliance_snapshot(db: Session) -> tuple[int, int, list[dict]]:
+    """Return required cadence compliance for every active mentor allocation."""
+    now = datetime.now(timezone.utc)
+    required_days = frequency_days(db)
+    compliant = 0
+    exceptions: list[dict] = []
+    allocations = db.scalars(select(Allocation).where(Allocation.is_active.is_(True))).all()
+    for allocation in allocations:
+        last_meeting = db.scalar(
+            select(MeetingRecord.meeting_at)
+            .where(MeetingRecord.student_id == allocation.student_id, MeetingRecord.mentor_id == allocation.mentor_id)
+            .order_by(MeetingRecord.meeting_at.desc())
+        )
+        reference_date = last_meeting or allocation.allocated_at
+        if reference_date.tzinfo is None:
+            reference_date = reference_date.replace(tzinfo=timezone.utc)
+        due_at = reference_date + timedelta(days=required_days)
+        if due_at >= now:
+            compliant += 1
+        else:
+            exceptions.append({
+                "student_id": allocation.student_id,
+                "mentor_id": allocation.mentor_id,
+                "last_meeting_at": last_meeting,
+                "due_at": due_at,
+                "days_overdue": (now - due_at).days,
+            })
+    return required_days, compliant, exceptions
+
+
+def _simple_pdf(lines: list[str]) -> bytes:
+    """Generate a compact text-only PDF without a heavyweight runtime dependency."""
+    safe_lines = [line.encode("ascii", "replace").decode().replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") for line in lines]
+    content = "BT /F1 11 Tf 50 790 Td 14 TL " + " ".join(f"({line}) Tj T*" for line in safe_lines) + " ET"
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        f"<< /Length {len(content.encode())} >>\nstream\n{content}\nendstream",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    result = "%PDF-1.4\n"
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(result.encode()))
+        result += f"{index} 0 obj\n{obj}\nendobj\n"
+    xref = len(result.encode())
+    result += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n"
+    result += "".join(f"{offset:010d} 00000 n \n" for offset in offsets[1:])
+    result += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+    return result.encode()
+
+
+@router.get("/agent-health")
+def agent_health_report(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(require_permission(Permission.VIEW_REPORTS)),
+):
+    try:
+        result = db.execute(text("SELECT * FROM agentops.v_agent_health")).mappings().all()
+    except SQLAlchemyError:
+        db.rollback()
+        return {"report": "agent_health", "agents": []}
+    return {"report": "agent_health", "generated_for_user_id": user.id, "agents": [dict(row) for row in result]}
+
+
+@router.get("/intervention-effectiveness")
+def intervention_effectiveness_report(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(require_permission(Permission.VIEW_REPORTS)),
+):
+    try:
+        result = db.execute(text("SELECT * FROM agentops.v_intervention_effectiveness")).mappings().all()
+    except SQLAlchemyError:
+        db.rollback()
+        result = []
+    return {"report": "intervention_effectiveness", "generated_for_user_id": user.id, "interventions": [dict(row) for row in result]}
 
 
 @router.get("/compliance")
@@ -45,6 +131,17 @@ def compliance_report(
 
     total_meetings = db.scalar(
         select(func.count(MeetingRecord.id))
+    ) or 0
+
+    scheduled_meetings = db.scalar(select(func.count(ScheduledMeeting.id))) or 0
+    completed_scheduled_meetings = db.scalar(
+        select(func.count(ScheduledMeeting.id)).where(ScheduledMeeting.status == ScheduledMeetingStatus.COMPLETED)
+    ) or 0
+    missed_scheduled_meetings = db.scalar(
+        select(func.count(ScheduledMeeting.id)).where(
+            ScheduledMeeting.status == ScheduledMeetingStatus.SCHEDULED,
+            ScheduledMeeting.scheduled_for < datetime.utcnow(),
+        )
     ) or 0
 
     open_actions = db.scalar(
@@ -90,6 +187,9 @@ def compliance_report(
     students_with_meetings = db.scalar(
         select(func.count(func.distinct(MeetingRecord.student_id)))
     ) or 0
+    required_frequency_days, frequency_compliant, frequency_exceptions = frequency_compliance_snapshot(db)
+    active_allocations_count = int(active_allocations)
+    frequency_compliance = round(frequency_compliant / active_allocations_count * 100, 2) if active_allocations_count else 100.0
 
     meeting_coverage = (
         round((students_with_meetings / total_students) * 100, 2)
@@ -115,8 +215,15 @@ def compliance_report(
             "active_students": total_students,
             "active_allocations": active_allocations,
             "total_meetings": total_meetings,
+            "scheduled_meetings": scheduled_meetings,
+            "completed_scheduled_meetings": completed_scheduled_meetings,
+            "missed_scheduled_meetings": missed_scheduled_meetings,
             "students_with_meetings": students_with_meetings,
             "meeting_coverage_percent": meeting_coverage,
+            "required_frequency_days": required_frequency_days,
+            "frequency_compliant_allocations": frequency_compliant,
+            "frequency_overdue_allocations": len(frequency_exceptions),
+            "frequency_compliance_percent": frequency_compliance,
             "open_actions": open_actions,
             "overdue_actions": overdue_actions,
             "completed_actions": completed_actions,
@@ -250,3 +357,64 @@ def audit_summary_report(
         "unique_actors": int(actor_count),
         "actions": actions,
     }
+
+
+@router.get("/accreditation-evidence.csv")
+def accreditation_evidence_csv(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(require_permission(Permission.VIEW_REPORTS)),
+):
+    """Download audit-ready mentoring evidence without exposing note contents."""
+    required_days, compliant, exceptions = frequency_compliance_snapshot(db)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Agent 45 Student Mentoring — Accreditation Evidence"])
+    writer.writerow(["Generated at (UTC)", datetime.now(timezone.utc).isoformat()])
+    writer.writerow(["Required mentoring frequency (days)", required_days])
+    writer.writerow(["Frequency-compliant allocations", compliant])
+    writer.writerow([])
+    writer.writerow(["Frequency exceptions"])
+    writer.writerow(["student_id", "mentor_id", "last_meeting_at", "due_at", "days_overdue"])
+    for row in exceptions:
+        writer.writerow([row["student_id"], row["mentor_id"], row["last_meeting_at"], row["due_at"], row["days_overdue"]])
+    writer.writerow([])
+    writer.writerow(["Mentor load register"])
+    writer.writerow(["mentor_id", "mentor_name", "capacity", "active_students", "utilization_percent"])
+    load_rows = db.execute(
+        select(Mentor.id, User.full_name, Mentor.max_students, func.count(Allocation.id).label("active_students"))
+        .join(User, User.id == Mentor.user_id)
+        .outerjoin(Allocation, (Allocation.mentor_id == Mentor.id) & Allocation.is_active.is_(True))
+        .where(Mentor.is_active.is_(True)).group_by(Mentor.id, User.full_name, Mentor.max_students).order_by(User.full_name)
+    ).all()
+    for row in load_rows:
+        capacity = int(row.max_students or 0)
+        active = int(row.active_students or 0)
+        writer.writerow([row.id, row.full_name, capacity, active, round(active / capacity * 100, 2) if capacity else 0])
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=agent45_accreditation_evidence.csv"},
+    )
+
+
+@router.get("/accreditation-evidence.pdf")
+def accreditation_evidence_pdf(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(require_permission(Permission.VIEW_REPORTS)),
+):
+    """Download a concise, shareable accreditation evidence summary."""
+    required_days, compliant, exceptions = frequency_compliance_snapshot(db)
+    active_allocations = db.scalar(select(func.count(Allocation.id)).where(Allocation.is_active.is_(True))) or 0
+    completed_actions = db.scalar(select(func.count(ActionItem.id)).where(ActionItem.status == ActionStatus.COMPLETED)) or 0
+    total_actions = db.scalar(select(func.count(ActionItem.id))) or 0
+    pdf = _simple_pdf([
+        "Agent 45 - Student Mentoring Accreditation Evidence",
+        f"Generated (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}",
+        f"Institutional mentoring frequency: every {required_days} days",
+        f"Active mentor allocations: {active_allocations}",
+        f"Cadence-compliant allocations: {compliant}",
+        f"Cadence exceptions: {len(exceptions)}",
+        f"Action items closed: {completed_actions} of {total_actions}",
+        "Detailed allocation and exception evidence is included in the companion CSV export.",
+    ])
+    return StreamingResponse(iter([pdf]), media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=agent45_accreditation_evidence.pdf"})
