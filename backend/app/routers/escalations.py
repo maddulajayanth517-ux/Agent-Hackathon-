@@ -6,7 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Escalation, EscalationStatus, FlagSeverity, UserRole
+from ..models import Alert, Escalation, EscalationStatus, FlagSeverity, ServiceQueue, User, UserRole
+from ..notifications import send_email_alert
 from ..rbac import can_access_student, get_current_user
 from ..schemas import UserContext
 
@@ -26,6 +27,13 @@ class EscalationUpdate(BaseModel):
     resolution_notes: str | None = Field(default=None, max_length=2000)
 
 
+class QueueUpsert(BaseModel):
+    code: str = Field(min_length=2, max_length=50)
+    name: str = Field(min_length=2, max_length=150)
+    recipient_user_id: int | None = None
+    recipient_email: str | None = None
+
+
 class EscalationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -33,6 +41,8 @@ class EscalationResponse(BaseModel):
     student_id: int
     raised_by: int
     assigned_to: int | None
+    destination: str
+    queue_id: int | None
     severity: FlagSeverity
     reason: str
     status: EscalationStatus
@@ -47,6 +57,100 @@ MANAGE_ROLES = {
     UserRole.HOD,
     UserRole.COUNSELLOR,
 }
+
+
+@router.get("/queues")
+def list_queues(db: Session = Depends(get_db), user: UserContext = Depends(get_current_user)):
+    if user.role not in {UserRole.ADMIN, UserRole.HOD}:
+        raise HTTPException(status_code=403, detail="Only administrators or HOD users can view escalation queues")
+    return db.scalars(select(ServiceQueue).order_by(ServiceQueue.code)).all()
+
+
+@router.put("/queues/{code}")
+def upsert_queue(code: str, payload: QueueUpsert, db: Session = Depends(get_db), user: UserContext = Depends(get_current_user)):
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only administrators can configure escalation queues")
+    normalized = code.strip().upper()
+    if normalized != payload.code.strip().upper():
+        raise HTTPException(status_code=422, detail="Queue code must match path")
+    queue = db.scalar(select(ServiceQueue).where(ServiceQueue.code == normalized))
+    if queue is None:
+        queue = ServiceQueue(code=normalized, name=payload.name.strip())
+        db.add(queue)
+    queue.name, queue.recipient_user_id, queue.recipient_email, queue.is_active = payload.name.strip(), payload.recipient_user_id, payload.recipient_email, True
+    db.commit(); db.refresh(queue)
+    return queue
+
+
+def _route_destination(severity: FlagSeverity, reason: str) -> tuple[str, str]:
+    text = (reason or "").lower()
+    if "academic" in text or severity in {FlagSeverity.HIGH, FlagSeverity.CRITICAL}:
+        return "HOD", "HIGH" if severity in {FlagSeverity.HIGH, FlagSeverity.MEDIUM} else "CRITICAL"
+    if "financial" in text:
+        return "Scholarship / Fee Section", "HIGH"
+    if "personal" in text or "emotional" in text or "counselling" in text:
+        return "Counselling Cell", "HIGH"
+    return "Mentor", "MEDIUM"
+
+
+@router.get(
+    "/{escalation_id}",
+    response_model=dict,
+)
+def get_escalation_by_id(
+    escalation_id: int,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    escalation = db.scalar(
+        select(Escalation).where(Escalation.id == escalation_id)
+    )
+
+    if escalation is not None:
+        if not can_access_student(db, user, escalation.student_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Student access denied")
+        destination, priority = escalation.destination, _route_destination(escalation.severity, escalation.reason)[1]
+        return {
+            "id": escalation.id,
+            "student_id": escalation.student_id,
+            "raised_by": escalation.raised_by,
+            "assigned_to": escalation.assigned_to,
+            "severity": escalation.severity,
+            "reason": escalation.reason,
+            "status": escalation.status,
+            "resolution_notes": escalation.resolution_notes,
+            "created_at": escalation.created_at,
+            "resolved_at": escalation.resolved_at,
+            "destination": destination,
+            "priority": priority,
+        }
+
+    flag = db.scalar(
+        select(__import__('..models', fromlist=['Flag']).Flag).where(
+            __import__('..models', fromlist=['Flag']).Flag.id == escalation_id,
+            __import__('..models', fromlist=['Flag']).Flag.is_active.is_(True),
+        )
+    )
+    if flag is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Escalation not found")
+    if not can_access_student(db, user, flag.student_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Student access denied")
+
+    destination, priority = _route_destination(flag.severity, flag.description)
+    return {
+        "id": flag.id,
+        "student_id": flag.student_id,
+        "raised_by": flag.created_by,
+        "assigned_to": None,
+        "severity": flag.severity,
+        "reason": flag.description,
+        "status": "open",
+        "resolution_notes": None,
+        "created_at": flag.created_at,
+        "resolved_at": None,
+        "destination": destination,
+        "priority": priority,
+    }
 
 
 @router.post(
@@ -78,18 +182,35 @@ def create_escalation(
             },
         )
 
+    destination, _ = _route_destination(payload.severity, payload.reason)
+    queue_code = {"HOD": "HOD", "Counselling Cell": "COUNSELLING", "Scholarship / Fee Section": "SCHOLARSHIP_FEE"}.get(destination)
+    queue = db.scalar(select(ServiceQueue).where(ServiceQueue.code == queue_code, ServiceQueue.is_active.is_(True))) if queue_code else None
     escalation = Escalation(
         student_id=payload.student_id,
         raised_by=user.id,
-        assigned_to=payload.assigned_to,
+        assigned_to=payload.assigned_to or None,
+        destination=destination,
+        queue_id=queue.id if queue else None,
         severity=payload.severity,
         reason=payload.reason.strip(),
         status=EscalationStatus.OPEN,
     )
 
+    if payload.assigned_to is not None:
+        assignee = db.scalar(select(User).where(User.id == payload.assigned_to, User.is_active.is_(True)))
+        if assignee is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Escalation assignee must be an active user")
+    elif queue and queue.recipient_user_id:
+        escalation.assigned_to = queue.recipient_user_id
+
     db.add(escalation)
     db.commit()
     db.refresh(escalation)
+    if queue and queue.recipient_user_id:
+        db.add(Alert(student_id=escalation.student_id, recipient_id=queue.recipient_user_id, severity=escalation.severity.value.upper(), title=f"Escalation routed: {destination}", body=escalation.reason, channel="IN_APP"))
+        db.commit()
+    if queue and queue.recipient_email:
+        send_email_alert(recipient=queue.recipient_email, subject=f"Mentoring escalation: {destination}", body=escalation.reason)
 
     return escalation
 

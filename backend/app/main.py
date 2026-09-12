@@ -1,18 +1,32 @@
+import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import engine
-from .routers import allocations, brief, meetings, reports, flags, escalations
+from .routers import alerts, allocations, brief, meetings, reports, flags, escalations, schedules, policy, auth
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     connection = engine.connect()
     connection.close()
-    yield
-    engine.dispose()
+    task = None
+    if os.getenv("REMINDER_SCHEDULER_ENABLED", "true").lower() == "true":
+        from .scheduler import reminder_scheduler
+        task = asyncio.create_task(reminder_scheduler(), name="mentoring-reminders")
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        engine.dispose()
 
 
 app = FastAPI(
@@ -67,3 +81,7 @@ app.include_router(flags.router)
 app.include_router(meetings.router)
 app.include_router(reports.router)
 app.include_router(escalations.router)
+app.include_router(alerts.router)
+app.include_router(schedules.router)
+app.include_router(policy.router)
+app.include_router(auth.router)

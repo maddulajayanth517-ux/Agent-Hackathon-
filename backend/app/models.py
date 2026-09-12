@@ -35,6 +35,24 @@ class MeetingMode(str, Enum):
     PHONE = "phone"
 
 
+class ScheduledMeetingStatus(str, Enum):
+    SCHEDULED = "scheduled"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    MISSED = "missed"
+
+
+class MentoringPolicy(Base):
+    """Singleton institutional policy; row id=1 is the active policy."""
+    __tablename__ = "mentoring_policy"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    required_frequency_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    reminder_days_before: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
 class ActionStatus(str, Enum):
     OPEN = "open"
     IN_PROGRESS = "in_progress"
@@ -57,12 +75,23 @@ class EscalationStatus(str, Enum):
     CLOSED = "closed"
 
 
+class ServiceQueue(Base):
+    __tablename__ = "service_queues"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    recipient_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    recipient_email: Mapped[str | None] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
 class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     full_name: Mapped[str] = mapped_column(String(150), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255))
     role: Mapped[UserRole] = mapped_column(
         SAEnum(UserRole, native_enum=False),
         nullable=False,
@@ -162,6 +191,11 @@ class Allocation(Base):
         nullable=False,
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    allocation_reason: Mapped[str] = mapped_column(String(500), default="INITIAL", nullable=False)
+    reallocated_from_mentor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("mentors.id", ondelete="SET NULL")
+    )
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         UniqueConstraint(
@@ -209,6 +243,14 @@ class MeetingRecord(Base):
     notes: Mapped[str] = mapped_column(Text, nullable=False)
     student_concerns: Mapped[str | None] = mapped_column(Text)
     mentor_observations: Mapped[str | None] = mapped_column(Text)
+    academic_progress: Mapped[str | None] = mapped_column(Text)
+    attendance_review: Mapped[str | None] = mapped_column(Text)
+    personal_circumstances: Mapped[str | None] = mapped_column(Text)
+    career_direction: Mapped[str | None] = mapped_column(Text)
+    recording_boundary_acknowledged: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
 
     next_meeting_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -453,3 +495,52 @@ class AuditEvent(Base):
         nullable=False,
         index=True,
     )
+
+
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    recipient_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    flag_id: Mapped[int | None] = mapped_column(
+        ForeignKey("flags.id", ondelete="SET NULL"),
+        index=True,
+    )
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    channel: Mapped[str] = mapped_column(String(20), default="IN_APP", nullable=False)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    actioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+        index=True,
+    )
+    destination: Mapped[str] = mapped_column(String(150), default="Mentor", nullable=False)
+    queue_id: Mapped[int | None] = mapped_column(ForeignKey("service_queues.id", ondelete="SET NULL"))
+
+
+class ScheduledMeeting(Base):
+    __tablename__ = "scheduled_meetings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("students.id", ondelete="CASCADE"), nullable=False, index=True)
+    mentor_id: Mapped[int] = mapped_column(ForeignKey("mentors.id", ondelete="RESTRICT"), nullable=False, index=True)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    mode: Mapped[MeetingMode] = mapped_column(SAEnum(MeetingMode, native_enum=False), nullable=False)
+    agenda: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[ScheduledMeetingStatus] = mapped_column(SAEnum(ScheduledMeetingStatus, native_enum=False), default=ScheduledMeetingStatus.SCHEDULED, nullable=False, index=True)
+    completed_meeting_id: Mapped[int | None] = mapped_column(ForeignKey("meeting_records.id", ondelete="SET NULL"))
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
