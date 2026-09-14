@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import engine
-from .routers import alerts, allocations, brief, meetings, reports, flags, escalations, schedules, policy, auth
+from .routers import alerts, allocations, announcements, audit, brief, corrections, dashboard, meetings, messages, reports, flags, escalations, schedules, policy, auth
 
 
 @asynccontextmanager
@@ -44,9 +44,16 @@ app = FastAPI(
 )
 
 
+_default_origins = "http://localhost:3000,http://127.0.0.1:3000"
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", _default_origins).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -77,6 +84,7 @@ def health_check():
 
 app.include_router(allocations.router)
 app.include_router(brief.router)
+app.include_router(dashboard.router)
 app.include_router(flags.router)
 app.include_router(meetings.router)
 app.include_router(reports.router)
@@ -85,3 +93,7 @@ app.include_router(alerts.router)
 app.include_router(schedules.router)
 app.include_router(policy.router)
 app.include_router(auth.router)
+app.include_router(corrections.router)
+app.include_router(audit.router)
+app.include_router(messages.router)
+app.include_router(announcements.router)

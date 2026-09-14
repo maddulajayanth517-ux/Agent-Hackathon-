@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .institutional import get_institutional_context
-from .models import ActionItem, ActionStatus, Flag, MeetingRecord
+from .models import ActionItem, ActionStatus, Flag, MeetingRecord, Student
 
 
 RISK_SCORE_MAP = {
@@ -45,7 +45,7 @@ def _score_student_context(
     actions: Iterable[ActionItem],
     meetings: Iterable[MeetingRecord],
     now: datetime,
-) -> tuple[int, str, list[str], list[str]]:
+) -> tuple[int, str, list[str], list[str], list[str]]:
     risk_score = 0
     reasons: list[str] = []
     alerts: list[str] = []
@@ -117,12 +117,15 @@ def _score_student_context(
             "Keep mentoring notes current and actionable.",
         ]
 
-    return risk_score, level, alerts, recommended
+    return risk_score, level, alerts, recommended, reasons
 
 
 def build_student_mentor_brief(db: Session, student_id: int) -> dict[str, Any]:
     now = datetime.utcnow()
-    institutional_context = get_institutional_context(db, student_id)
+    student = db.get(Student, student_id)
+    institutional_context = (
+        get_institutional_context(db, student.register_number) if student else None
+    )
 
     meetings = db.scalars(
         select(MeetingRecord)
@@ -142,7 +145,7 @@ def build_student_mentor_brief(db: Session, student_id: int) -> dict[str, Any]:
         .order_by(Flag.created_at.desc())
     ).all()
 
-    score, level, alerts, recommendations = _score_student_context(
+    score, level, alerts, recommendations, evidence = _score_student_context(
         flags=flags,
         actions=actions,
         meetings=meetings,
@@ -169,6 +172,7 @@ def build_student_mentor_brief(db: Session, student_id: int) -> dict[str, Any]:
         "risk_level": level,
         "alert_count": len(alerts),
         "alerts": alerts,
+        "evidence": evidence,
         "recommendations": recommendations,
         "summary": (
             "Student is currently in a "

@@ -2,7 +2,7 @@ import csv
 import io
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -418,3 +418,27 @@ def accreditation_evidence_pdf(
         "Detailed allocation and exception evidence is included in the companion CSV export.",
     ])
     return StreamingResponse(iter([pdf]), media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=agent45_accreditation_evidence.pdf"})
+
+
+@router.post("/accreditation-evidence/register")
+def register_accreditation_evidence(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(require_permission(Permission.VIEW_REPORTS)),
+):
+    """Register the Agent 45 evidence pack in the supplied quality schema."""
+    try:
+        row = db.execute(text("""
+            INSERT INTO quality.evidence_item
+                (title, evidence_type, period_start, period_end, source_schema,
+                 source_table, generated_by_agent, content_hash)
+            VALUES
+                ('Agent 45 Student Mentoring accreditation evidence', 'DATA_EXPORT',
+                 CURRENT_DATE, CURRENT_DATE, 'public', 'meeting_records',
+                 'Agent 45', md5(CURRENT_TIMESTAMP::text || :actor))
+            RETURNING evidence_item_id, created_at
+        """), {"actor": str(user.id)}).mappings().one()
+        db.commit()
+        return {"registered": True, "evidence_item_id": str(row["evidence_item_id"]), "created_at": row["created_at"]}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Quality evidence schema is unavailable") from exc

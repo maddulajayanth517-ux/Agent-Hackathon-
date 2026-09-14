@@ -31,6 +31,19 @@ class AlertResponse(BaseModel):
     created_at: datetime
 
 
+@router.get("/mine", response_model=list[AlertResponse])
+def list_my_alerts(
+    unread_only: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    query = select(Alert).where(Alert.recipient_id == user.id)
+    if unread_only:
+        query = query.where(Alert.read_at.is_(None))
+    return db.scalars(query.order_by(Alert.created_at.desc()).limit(limit)).all()
+
+
 @router.get("/student/{student_id}", response_model=list[AlertResponse])
 def list_student_alerts(
     student_id: int,

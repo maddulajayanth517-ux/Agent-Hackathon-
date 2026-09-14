@@ -66,7 +66,7 @@ def get_current_user(
     if authorization and authorization.lower().startswith("bearer "):
         claims = verify_access_token(authorization.split(" ", 1)[1])
         user_id = int(claims["sub"])
-    elif x_user_id is not None and os.getenv("AUTH_ALLOW_DEV_HEADER", "true").lower() == "true":
+    elif x_user_id is not None and os.getenv("AUTH_ALLOW_DEV_HEADER", "false").lower() == "true":
         user_id = x_user_id
     else:
         raise HTTPException(

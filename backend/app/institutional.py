@@ -9,9 +9,14 @@ from sqlalchemy.orm import Session
 
 def get_institutional_context(
     db: Session,
-    student_key: int,
+    register_number: str,
 ) -> dict[str, Any] | None:
-    """Read the institutional views without changing the existing public schema."""
+    """Read the institutional views without changing the existing public schema.
+
+    The shared institutional schema keys students by ``roll_no``, which
+    corresponds to this application's ``Student.register_number`` — not the
+    mentoring app's internal integer primary key.
+    """
     try:
         profile = db.execute(
             text(
@@ -25,7 +30,7 @@ def get_institutional_context(
                 WHERE roll_no = :roll_no
                 """
             ),
-            {"roll_no": str(student_key)},
+            {"roll_no": register_number},
         ).mappings().first()
 
         if profile is None:

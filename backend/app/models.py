@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -15,6 +16,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
+from .routing import route_escalation
 
 
 def utc_now() -> datetime:
@@ -36,10 +38,18 @@ class MeetingMode(str, Enum):
 
 
 class ScheduledMeetingStatus(str, Enum):
+    REQUESTED = "requested"
     SCHEDULED = "scheduled"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     MISSED = "missed"
+
+
+class CorrectionStatus(str, Enum):
+    OPEN = "open"
+    REVIEWED = "reviewed"
+    RESOLVED = "resolved"
+    DISMISSED = "dismissed"
 
 
 class MentoringPolicy(Base):
@@ -251,6 +261,13 @@ class MeetingRecord(Base):
         Boolean, default=False, nullable=False
     )
 
+    # Point-in-time institutional snapshot captured at meeting creation so a
+    # later "what changed?" view can diff against a real prior value instead
+    # of only ever comparing against the live present-day figure.
+    attendance_pct_snapshot: Mapped[float | None] = mapped_column(Numeric(5, 2))
+    cgpa_snapshot: Mapped[float | None] = mapped_column(Numeric(4, 2))
+    backlog_count_snapshot: Mapped[int | None] = mapped_column(Integer)
+
 
     next_meeting_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -433,6 +450,8 @@ class Escalation(Base):
     assigned_to: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
     )
+    destination: Mapped[str] = mapped_column(String(150), default="Mentor", nullable=False)
+    queue_id: Mapped[int | None] = mapped_column(ForeignKey("service_queues.id", ondelete="SET NULL"))
 
     severity: Mapped[FlagSeverity] = mapped_column(
         SAEnum(FlagSeverity, native_enum=False),
@@ -462,6 +481,18 @@ class Escalation(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
     )
+
+    @property
+    def priority(self) -> str:
+        """Recommended urgency for this escalation, from the same rule that routed it."""
+        _, priority, _ = route_escalation(self.severity, self.reason)
+        return priority
+
+    @property
+    def routing_explanation(self) -> str:
+        """Human-readable reason this escalation was routed to its destination."""
+        _, _, explanation = route_escalation(self.severity, self.reason)
+        return explanation
 
 
 class AuditEvent(Base):
@@ -527,8 +558,6 @@ class Alert(Base):
         nullable=False,
         index=True,
     )
-    destination: Mapped[str] = mapped_column(String(150), default="Mentor", nullable=False)
-    queue_id: Mapped[int | None] = mapped_column(ForeignKey("service_queues.id", ondelete="SET NULL"))
 
 
 class ScheduledMeeting(Base):
@@ -544,3 +573,72 @@ class ScheduledMeeting(Base):
     completed_meeting_id: Mapped[int | None] = mapped_column(ForeignKey("meeting_records.id", ondelete="SET NULL"))
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class CorrectionRequest(Base):
+    """A student's request to review or correct information recorded about them.
+
+    This is the in-app counterpart to the guardrail requirement that students
+    can flag inaccurate mentoring information for review, rather than only
+    being able to email their mentor outside the system.
+    """
+    __tablename__ = "correction_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("students.id", ondelete="CASCADE"), nullable=False, index=True)
+    meeting_id: Mapped[int | None] = mapped_column(ForeignKey("meeting_records.id", ondelete="SET NULL"), index=True)
+    field_reference: Mapped[str] = mapped_column(String(150), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[CorrectionStatus] = mapped_column(
+        SAEnum(CorrectionStatus, native_enum=False),
+        default=CorrectionStatus.OPEN,
+        nullable=False,
+        index=True,
+    )
+    resolution_notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    resolved_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Message(Base):
+    """One running conversation per student.
+
+    Deliberately scoped to the student rather than to a sender/recipient
+    pair: whoever is already authorized to see that student's mentoring
+    record today (student, current mentor, or a HOD/counsellor handling an
+    active escalation for them) can read and post here. Access is checked
+    with the same ``can_access_student`` rule used everywhere else, so the
+    privacy guardrail never has to be re-specified for messaging.
+    """
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("students.id", ondelete="CASCADE"), nullable=False, index=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_messages_student_created", "student_id", "created_at"),
+    )
+
+
+class AnnouncementScope(str, Enum):
+    ALL = "all"
+    MENTORS = "mentors"
+    STUDENTS = "students"
+    MY_MENTEES = "my_mentees"
+
+
+class Announcement(Base):
+    """A one-way institutional notice: HOD/Admin broadcast to everyone,
+    mentors, or students, or a mentor's notice to their own mentees only."""
+    __tablename__ = "announcements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    scope: Mapped[AnnouncementScope] = mapped_column(SAEnum(AnnouncementScope, native_enum=False), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)

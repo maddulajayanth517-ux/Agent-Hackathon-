@@ -5,10 +5,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..audit import record_audit_event
 from ..database import get_db
-from ..models import Alert, Escalation, EscalationStatus, FlagSeverity, ServiceQueue, User, UserRole
+from ..models import Alert, Escalation, EscalationStatus, Flag, FlagSeverity, ServiceQueue, User, UserRole
 from ..notifications import send_email_alert
 from ..rbac import can_access_student, get_current_user
+from ..routing import route_escalation
 from ..schemas import UserContext
 
 router = APIRouter(prefix="/escalations", tags=["Escalations"])
@@ -49,6 +51,8 @@ class EscalationResponse(BaseModel):
     resolution_notes: str | None
     created_at: datetime
     resolved_at: datetime | None
+    priority: str
+    routing_explanation: str
 
 
 MANAGE_ROLES = {
@@ -82,15 +86,25 @@ def upsert_queue(code: str, payload: QueueUpsert, db: Session = Depends(get_db),
     return queue
 
 
-def _route_destination(severity: FlagSeverity, reason: str) -> tuple[str, str]:
-    text = (reason or "").lower()
-    if "academic" in text or severity in {FlagSeverity.HIGH, FlagSeverity.CRITICAL}:
-        return "HOD", "HIGH" if severity in {FlagSeverity.HIGH, FlagSeverity.MEDIUM} else "CRITICAL"
-    if "financial" in text:
-        return "Scholarship / Fee Section", "HIGH"
-    if "personal" in text or "emotional" in text or "counselling" in text:
-        return "Counselling Cell", "HIGH"
-    return "Mentor", "MEDIUM"
+@router.get("/mine", response_model=list[EscalationResponse])
+def list_my_escalations(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    """Escalations relevant to the current user's role: assigned to them
+    (HOD/Counsellor queue owners) or raised by them (mentors)."""
+    if user.role in {UserRole.HOD, UserRole.COUNSELLOR}:
+        query = select(Escalation).where(Escalation.assigned_to == user.id)
+    elif user.role == UserRole.MENTOR:
+        query = select(Escalation).where(Escalation.raised_by == user.id)
+    elif user.role == UserRole.ADMIN:
+        query = select(Escalation).where(
+            Escalation.status.in_([EscalationStatus.OPEN, EscalationStatus.ACKNOWLEDGED])
+        )
+    else:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Students cannot view escalation queues")
+
+    return db.scalars(query.order_by(Escalation.created_at.desc()).limit(100)).all()
 
 
 @router.get(
@@ -109,7 +123,7 @@ def get_escalation_by_id(
     if escalation is not None:
         if not can_access_student(db, user, escalation.student_id):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Student access denied")
-        destination, priority = escalation.destination, _route_destination(escalation.severity, escalation.reason)[1]
+        _, priority, explanation = route_escalation(escalation.severity, escalation.reason)
         return {
             "id": escalation.id,
             "student_id": escalation.student_id,
@@ -121,14 +135,15 @@ def get_escalation_by_id(
             "resolution_notes": escalation.resolution_notes,
             "created_at": escalation.created_at,
             "resolved_at": escalation.resolved_at,
-            "destination": destination,
+            "destination": escalation.destination,
             "priority": priority,
+            "routing_explanation": explanation,
         }
 
     flag = db.scalar(
-        select(__import__('..models', fromlist=['Flag']).Flag).where(
-            __import__('..models', fromlist=['Flag']).Flag.id == escalation_id,
-            __import__('..models', fromlist=['Flag']).Flag.is_active.is_(True),
+        select(Flag).where(
+            Flag.id == escalation_id,
+            Flag.is_active.is_(True),
         )
     )
     if flag is None:
@@ -136,7 +151,7 @@ def get_escalation_by_id(
     if not can_access_student(db, user, flag.student_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Student access denied")
 
-    destination, priority = _route_destination(flag.severity, flag.description)
+    destination, priority, explanation = route_escalation(flag.severity, flag.description)
     return {
         "id": flag.id,
         "student_id": flag.student_id,
@@ -150,6 +165,7 @@ def get_escalation_by_id(
         "resolved_at": None,
         "destination": destination,
         "priority": priority,
+        "routing_explanation": explanation,
     }
 
 
@@ -182,7 +198,7 @@ def create_escalation(
             },
         )
 
-    destination, _ = _route_destination(payload.severity, payload.reason)
+    destination, _, _ = route_escalation(payload.severity, payload.reason)
     queue_code = {"HOD": "HOD", "Counselling Cell": "COUNSELLING", "Scholarship / Fee Section": "SCHOLARSHIP_FEE"}.get(destination)
     queue = db.scalar(select(ServiceQueue).where(ServiceQueue.code == queue_code, ServiceQueue.is_active.is_(True))) if queue_code else None
     escalation = Escalation(
@@ -204,6 +220,15 @@ def create_escalation(
         escalation.assigned_to = queue.recipient_user_id
 
     db.add(escalation)
+    db.flush()
+    record_audit_event(
+        db,
+        actor_id=user.id,
+        action="ESCALATION_CREATED",
+        resource_type="escalation",
+        resource_id=escalation.id,
+        details=f"student_id={escalation.student_id}; destination={destination}",
+    )
     db.commit()
     db.refresh(escalation)
     if queue and queue.recipient_user_id:
@@ -305,6 +330,15 @@ def update_escalation(
 
     if payload.resolution_notes is not None:
         escalation.resolution_notes = payload.resolution_notes.strip()
+
+    record_audit_event(
+        db,
+        actor_id=user.id,
+        action="ESCALATION_UPDATED",
+        resource_type="escalation",
+        resource_id=escalation.id,
+        details=f"status={escalation.status.value}",
+    )
 
     db.commit()
     db.refresh(escalation)
