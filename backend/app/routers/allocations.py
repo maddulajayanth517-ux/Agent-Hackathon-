@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Allocation, AuditEvent, MeetingRecord, Mentor, Student, UserRole
+from ..models import Allocation, AuditEvent, MeetingRecord, Mentor, Student, User, UserRole
 from ..rbac import get_current_user
 from ..schemas import AllocationCreate, AllocationResponse, UserContext
 
@@ -128,9 +130,24 @@ def create_allocation(
     return allocation
 
 
-@router.get(
-    "/recommend/{student_id}",
-)
+class StudentDirectoryCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=150)
+    email: str = Field(min_length=5, max_length=255)
+    register_number: str = Field(min_length=1, max_length=50)
+    department: str = Field(min_length=2, max_length=100)
+    year: int = Field(ge=1, le=10)
+    section: str | None = Field(default=None, max_length=20)
+
+
+class MentorDirectoryCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=150)
+    email: str = Field(min_length=5, max_length=255)
+    department: str = Field(min_length=2, max_length=100)
+    specialization: str | None = Field(default=None, max_length=255)
+    max_students: int = Field(default=30, ge=1, le=500)
+
+
+@router.get("/recommend/{student_id}")
 def recommend_allocation(student_id: int, db: Session = Depends(get_db), user: UserContext = Depends(get_current_user)):
     if user.role not in {UserRole.ADMIN, UserRole.HOD, UserRole.MENTOR}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to view allocation recommendations")
@@ -184,6 +201,80 @@ def recommend_allocation(student_id: int, db: Session = Depends(get_db), user: U
         "current_workload": current_workload,
         "capacity": best_mentor.max_students or 999,
     }
+
+
+@router.get("/directory/students")
+def student_directory(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    if user.role not in {UserRole.ADMIN, UserRole.HOD, UserRole.MENTOR}:
+        raise HTTPException(status_code=403, detail="You do not have permission to view the student directory")
+    query = select(Student).where(Student.is_active.is_(True)).order_by(Student.register_number)
+    if user.role == UserRole.MENTOR:
+        mentor = db.scalar(select(Mentor).where(Mentor.user_id == user.id, Mentor.is_active.is_(True)))
+        if mentor is None:
+            return []
+        query = query.join(Allocation, Allocation.student_id == Student.id).where(Allocation.mentor_id == mentor.id, Allocation.is_active.is_(True))
+    return [{"id": item.id, "name": item.user.full_name, "register_number": item.register_number, "department": item.department} for item in db.scalars(query).all()]
+
+
+@router.get("/directory/mentors")
+def mentor_directory(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    if user.role not in {UserRole.ADMIN, UserRole.HOD}:
+        raise HTTPException(status_code=403, detail="You do not have permission to view the mentor directory")
+    return [{"id": item.id, "name": item.user.full_name, "capacity": item.max_students, "department": item.department} for item in db.scalars(select(Mentor).where(Mentor.is_active.is_(True)).order_by(Mentor.id)).all()]
+
+
+@router.post("/directory/students", status_code=status.HTTP_201_CREATED)
+def add_student_to_directory(payload: StudentDirectoryCreate, db: Session = Depends(get_db), user: UserContext = Depends(get_current_user)):
+    if user.role not in {UserRole.ADMIN, UserRole.HOD}:
+        raise HTTPException(status_code=403, detail="Only administrators or HOD users can add students")
+    email = payload.email.strip().lower()
+    account = db.scalar(select(User).where(User.email == email))
+    if account is not None:
+        existing = db.scalar(select(Student).where(Student.user_id == account.id))
+        if existing is not None:
+            raise HTTPException(status_code=409, detail=f"Student already exists: {account.full_name} ({email})")
+        if account.role != UserRole.STUDENT:
+            raise HTTPException(status_code=409, detail="This email belongs to a non-student institutional account")
+        account.full_name = payload.full_name.strip()
+    else:
+        account = User(full_name=payload.full_name.strip(), email=email, role=UserRole.STUDENT)
+    profile = Student(user=account, register_number=payload.register_number.strip(), department=payload.department.strip(), year=payload.year, section=payload.section.strip() if payload.section else None)
+    try:
+        db.add(profile); db.commit(); db.refresh(profile)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Register number already exists")
+    return {"id": profile.id, "name": account.full_name, "register_number": profile.register_number}
+
+
+@router.post("/directory/mentors", status_code=status.HTTP_201_CREATED)
+def add_mentor_to_directory(payload: MentorDirectoryCreate, db: Session = Depends(get_db), user: UserContext = Depends(get_current_user)):
+    if user.role not in {UserRole.ADMIN, UserRole.HOD}:
+        raise HTTPException(status_code=403, detail="Only administrators or HOD users can add mentors")
+    email = payload.email.strip().lower()
+    account = db.scalar(select(User).where(User.email == email))
+    if account is not None:
+        existing = db.scalar(select(Mentor).where(Mentor.user_id == account.id))
+        if existing is not None:
+            raise HTTPException(status_code=409, detail=f"Mentor already exists: {account.full_name} ({email})")
+        if account.role != UserRole.MENTOR:
+            raise HTTPException(status_code=409, detail="This email belongs to a non-mentor institutional account")
+        account.full_name = payload.full_name.strip()
+    else:
+        account = User(full_name=payload.full_name.strip(), email=email, role=UserRole.MENTOR)
+    profile = Mentor(user=account, department=payload.department.strip(), specialization=payload.specialization.strip() if payload.specialization else None, max_students=payload.max_students)
+    try:
+        db.add(profile); db.commit(); db.refresh(profile)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Mentor profile could not be created")
+    return {"id": profile.id, "name": account.full_name, "capacity": profile.max_students}
 
 
 @router.get(

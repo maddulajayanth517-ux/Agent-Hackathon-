@@ -64,6 +64,11 @@ class MeetingCreate(BaseModel):
     next_meeting_at: datetime | None = None
     scheduled_meeting_id: int | None = None
     action_items: list[ActionItemCreate] = Field(default_factory=list)
+    # Manual fallback for the institutional snapshot (attendance/CGPA/backlogs),
+    # used only when no reading is available from the institutional profile feed.
+    attendance_pct: float | None = Field(default=None, ge=0, le=100)
+    cgpa: float | None = Field(default=None, ge=0, le=10)
+    backlog_count: int | None = Field(default=None, ge=0)
 
 
 class MeetingResponse(BaseModel):
@@ -87,6 +92,9 @@ class MeetingResponse(BaseModel):
     created_by: int
     created_at: datetime
     action_items: list[ActionItemResponse]
+    attendance_pct_snapshot: float | None = None
+    cgpa_snapshot: float | None = None
+    backlog_count_snapshot: int | None = None
 
 
 class ActionClosureResponse(BaseModel):

@@ -3,6 +3,8 @@ import asyncio
 import logging
 import os
 
+from sqlalchemy import text
+
 from .database import SessionLocal
 from .models import UserRole
 from .routers.alerts import run_meeting_reminders
@@ -17,7 +19,7 @@ async def reminder_scheduler() -> None:
     acquired = False
     try:
         # This session remains open, so exactly one worker owns the scheduler.
-        acquired = lock_db.execute(__import__("sqlalchemy").text("SELECT pg_try_advisory_lock(450045)")).scalar()
+        acquired = lock_db.execute(text("SELECT pg_try_advisory_lock(450045)")).scalar()
         if not acquired:
             logger.info("Reminder scheduler not started: another worker owns the lock")
             return
@@ -33,6 +35,6 @@ async def reminder_scheduler() -> None:
     finally:
         try:
             if acquired:
-                lock_db.execute(__import__("sqlalchemy").text("SELECT pg_advisory_unlock(450045)"))
+                lock_db.execute(text("SELECT pg_advisory_unlock(450045)"))
         finally:
             lock_db.close()

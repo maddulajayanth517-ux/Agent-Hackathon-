@@ -196,6 +196,7 @@ def get_student_brief(
         "score": risk_snapshot["risk_score"],
         "level": risk_snapshot["risk_level"],
         "alerts": risk_snapshot["alerts"],
+        "evidence": risk_snapshot["evidence"],
     }
     base_response["recommendations"] = risk_snapshot["recommendations"]
     base_response["next_steps"] = risk_snapshot["next_steps"]
@@ -218,6 +219,7 @@ def get_student_brief_compat(
         "score": 0,
         "level": "low",
         "alerts": [],
+        "evidence": [],
     }
     payload["recommendations"] = [
         "Continue regular mentoring review.",

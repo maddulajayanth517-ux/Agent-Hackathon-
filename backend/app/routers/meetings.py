@@ -1,10 +1,14 @@
+import json
+import os
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from ..database import get_db
+from ..institutional import get_institutional_context
 from ..models import (
     ActionItem,
     ActionStatus,
@@ -12,6 +16,7 @@ from ..models import (
     MeetingRecord,
     ScheduledMeeting,
     ScheduledMeetingStatus,
+    Student,
     User,
     UserRole,
 )
@@ -110,6 +115,18 @@ def create_meeting(
             detail="Authenticated user does not have an active mentor profile",
         )
 
+    student_record = db.get(Student, payload.student_id)
+    institutional_context = (
+        get_institutional_context(db, student_record.register_number)
+        if student_record
+        else None
+    )
+    institutional_profile = (institutional_context or {}).get("profile") or {}
+
+    def _snapshot_value(field: str, manual_entry):
+        value = institutional_profile.get(field)
+        return value if value is not None else manual_entry
+
     meeting = MeetingRecord(
         student_id=payload.student_id,
         mentor_id=mentor.id,
@@ -126,6 +143,9 @@ def create_meeting(
         recording_boundary_acknowledged=payload.recording_boundary_acknowledged,
         next_meeting_at=payload.next_meeting_at,
         created_by=user.id,
+        attendance_pct_snapshot=_snapshot_value("attendance_pct", payload.attendance_pct),
+        cgpa_snapshot=_snapshot_value("cgpa", payload.cgpa),
+        backlog_count_snapshot=_snapshot_value("backlog_count", payload.backlog_count),
     )
 
     db.add(meeting)
@@ -365,3 +385,77 @@ def refresh_overdue_actions(
     updated_count=updated_count,
     message=f"{updated_count} action items marked as overdue",
 )
+
+
+class ActionExtractionRequest(BaseModel):
+    student_id: int
+    transcript: str = Field(min_length=3, max_length=8000)
+
+
+class ExtractedAction(BaseModel):
+    title: str
+    description: str | None = None
+    owner_hint: str = Field(description='"student" or "mentor"')
+    due_date: date | None = None
+
+
+class ActionExtractionResponse(BaseModel):
+    actions: list[ExtractedAction]
+    source: str
+    message: str | None = None
+
+
+@router.post("/actions/extract", response_model=ActionExtractionResponse)
+def extract_actions_from_transcript(
+    payload: ActionExtractionRequest,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    if user.role != UserRole.MENTOR:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only mentors can extract action items")
+
+    if not can_access_student(db=db, user=user, student_id=payload.student_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Student access denied")
+
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return ActionExtractionResponse(
+            actions=[],
+            source="unavailable",
+            message="AI action extraction is temporarily unavailable. Add actions manually below.",
+        )
+
+    today = date.today().isoformat()
+    system_prompt = (
+        "You extract commitments from a student mentoring conversation into a strict JSON array. "
+        'Each item: {"title": short imperative string, "description": string or null, '
+        '"owner_hint": "student" or "mentor", "due_date": "YYYY-MM-DD" or null}. '
+        f"Today's date is {today}; resolve relative dates (e.g. Friday) against it. "
+        "Return ONLY the JSON array, no prose, no markdown fences. If no clear commitment exists, return []."
+    )
+
+    try:
+        from groq import Groq
+        response = Groq(api_key=api_key).chat.completions.create(
+            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": payload.transcript},
+            ],
+            temperature=0.1,
+            max_tokens=600,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:]
+        parsed = json.loads(raw)
+        actions = [ExtractedAction.model_validate(item) for item in parsed]
+        return ActionExtractionResponse(actions=actions, source="ai")
+    except Exception:
+        return ActionExtractionResponse(
+            actions=[],
+            source="unavailable",
+            message="AI could not parse this transcript into actions. Add actions manually below.",
+        )
